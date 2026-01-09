@@ -1,63 +1,93 @@
+// Glow Sensing Project
+// This Arduino sketch controls a TSL2591 light sensor and AW9523 LED driver.
+// It charges a sample with UV LEDs, then measures light decay over time.
+// Communication via serial commands: "start <charge_sec> <measure_sec>"
+
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_LTR390.h>
+#include <Adafruit_TSL2591.h>
+#include <Adafruit_Sensor.h>
 #include <Adafruit_AW9523.h>
 
-Adafruit_LTR390 ltr;
+// Sensor and driver objects
+Adafruit_TSL2591 tsl;
 Adafruit_AW9523 aw;
 
-const uint8_t uvLed1 = 1; // AW9523 pin used for demo
+// LED settings
+const uint8_t uvLedPin = 1;
+const int uvBrightness = 138; // ~20mA
+
+// Initialization flags
 bool aw_ok = false;
-bool ltr_ok = false;
+bool tsl_ok = false;
 
-const int uvBrightness = 138; // 140 = 20mA       don't exceed 172 = 25mA this will exceed the current limit of the LED
+// Timing variables (set via serial command)
+unsigned long startTime = 0;       // Start of charge phase
+unsigned long chargeTime = 5000;   // Charge duration in ms
+unsigned long measureTime = 60000; // Measure duration in ms
+unsigned long measureStart = 0;    // Start of measure phase
 
-unsigned long startTime = 0;
-const long chargeTime = 5000; // milliseconds
-uint32_t als = 0;
+// Sensor readings
+uint16_t full = 0; // Full-spectrum light value
 
-int state = 0; // state machine variable
+// State machine
+int state = 0; // 0: IDLE, 1: CHARGE, 2: MEASURE, 3: DONE
 
-const ltr390_gain_t gainTable[] = { // Gain options
-    LTR390_GAIN_1,
-    LTR390_GAIN_3,
-    LTR390_GAIN_6,
-    LTR390_GAIN_9,
-    LTR390_GAIN_18};
-
+// Gain settings for TSL2591
+const tsl2591Gain_t gainTable[] = {
+    TSL2591_GAIN_LOW,  // 1x
+    TSL2591_GAIN_MED,  // 25x
+    TSL2591_GAIN_HIGH, // 428x
+    TSL2591_GAIN_MAX   // 9876x
+};
 const uint8_t gainMin = 0;
-const uint8_t gainMax = 4;
+const uint8_t gainMax = 3;
+uint8_t gainIndex = 3; // Start with max gain
 
-unsigned long t = 0;
-unsigned long lastGainChangeMs = 0;
-uint8_t gainIndex = 0;
-const unsigned long gainCooldownMs = 1000; // example value
+// Integration time settings for TSL2591
+const tsl2591IntegrationTime_t intTable[] = {
+    TSL2591_INTEGRATIONTIME_100MS,
+    TSL2591_INTEGRATIONTIME_200MS,
+    TSL2591_INTEGRATIONTIME_300MS,
+    TSL2591_INTEGRATIONTIME_400MS,
+    TSL2591_INTEGRATIONTIME_500MS,
+    TSL2591_INTEGRATIONTIME_600MS};
+const uint8_t intMin = 0;
+const uint8_t intMax = 5;
+uint8_t intIndex = 5; // Start with max integration
 
-const uint32_t alsMax = 1048575;            // 2^20 - 1
-const uint32_t alsHigh = alsMax * 80 / 100; // ~80% full scale
-const uint32_t alsLow = alsMax * 5 / 100;   // ~5% full scale
+// Adjustment cooldown
+unsigned long lastAdjustMs = 0;
+const unsigned long adjustCooldownMs = 1000;
 
-void setGain(uint8_t index)
+// Thresholds for gain/integration adjustment
+const uint16_t fullMax = 65535;
+const uint16_t fullHigh = fullMax * 90 / 100; // 90% of max
+const uint16_t fullLow = fullMax * 10 / 100;  // 10% of max
+
+void setGainAndInt(uint8_t gainIdx, uint8_t intIdx)
 {
-  ltr.setGain(gainTable[index]);
+  tsl.setGain(gainTable[gainIdx]);
+  tsl.setTiming(intTable[intIdx]);
 }
 
-void initLTR390()
+void initTSL2591()
 {
-  ltr_ok = ltr.begin();
-  if (!ltr_ok)
+  tsl_ok = tsl.begin();
+  if (!tsl_ok)
   {
-    Serial.println("LTR390 NOT found!");
+    Serial.println("TSL2591 NOT found!");
   }
   else
   {
-    Serial.println("LTR390 found");
-    ltr.setMode(LTR390_MODE_ALS);
-    ltr.setResolution(LTR390_RESOLUTION_20BIT);
-    setGain(0);
+    Serial.println("TSL2591 found");
+    tsl.setGain(gainTable[gainIndex]);
+    tsl.setTiming(intTable[intIndex]);
+    tsl.enable();
   }
 }
 
+// Initialize AW9523 LED driver
 void initAW9523()
 {
   aw_ok = aw.begin();
@@ -68,92 +98,143 @@ void initAW9523()
   else
   {
     Serial.println("AW9523 found");
-    aw.pinMode(uvLed1, AW9523_LED_MODE);
-    aw.analogWrite(uvLed1, 0);
+    aw.pinMode(uvLedPin, AW9523_LED_MODE);
+    aw.analogWrite(uvLedPin, 0);
   }
 }
 
-void printCSV(unsigned long t, uint32_t als_val, uint8_t gain, const char *state)
+void printCSV(unsigned long t, unsigned long measureStart, uint16_t full_val, uint8_t gain, uint8_t int_idx, const char *state)
 {
   Serial.print(t);
   Serial.print(",");
-  Serial.print(als_val);
+  Serial.print(measureStart);
+  Serial.print(",");
+  Serial.print(full_val);
   Serial.print(",");
   Serial.print(gain);
   Serial.print(",");
+  Serial.print(int_idx);
+  Serial.print(",");
   Serial.println(state);
+  Serial.flush();
 }
 
 void runStateMachine()
 {
+  unsigned long t;
   switch (state)
   {
 
   case 0: // IDLE
     // LEDs off
-    aw.analogWrite(uvLed1, 0);
+    aw.analogWrite(uvLedPin, 0);
     digitalWrite(LED_BUILTIN, LOW);
 
     // listen for START command
-    printCSV(t, 0, 0, "IDLE");
-    startTime = millis();
-    state = 1; // TEMPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP replace later with serial command for start
+    if (Serial.available())
+    {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd.startsWith("start "))
+      {
+        String params = cmd.substring(6); // "5 60"
+        int space = params.indexOf(' ');
+        if (space > 0)
+        {
+          chargeTime = params.substring(0, space).toInt() * 1000L;
+          measureTime = params.substring(space + 1).toInt() * 1000L;
+        }
+        startTime = millis();
+        state = 1; // go to CHARGE
+      }
+    }
+    printCSV(millis(), 0, 0, 0, 0, "IDLE");
     break;
 
-  case 1:                                 // CHARGE
-    aw.analogWrite(uvLed1, uvBrightness); // turn leds on for charging
+  case 1:                                   // CHARGE
+    aw.analogWrite(uvLedPin, uvBrightness); // turn leds on for charging
     digitalWrite(LED_BUILTIN, HIGH);
     t = millis();
-    printCSV(t, 0, 0, "CHARGE");
+    printCSV(t, 0, 0, 0, 0, "CHARGE");
 
     if (millis() - startTime >= chargeTime)
     { // turn leds off after charge time
-      aw.analogWrite(uvLed1, 0);
+      aw.analogWrite(uvLedPin, 0);
       digitalWrite(LED_BUILTIN, LOW);
+      measureStart = millis();
       state = 2;
     }
     break;
 
   case 2: // MEASURE
-
-    if (ltr.newDataAvailable())
+  {
+    // Check for STOP command
+    if (Serial.available())
     {
-      als = ltr.readALS();
-      t = millis();
-
-      if (t - lastGainChangeMs >= gainCooldownMs)
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd == "stop")
       {
+        state = 3;
+        break;
+      }
+    }
 
-        if (als > alsHigh && gainIndex > gainMin)
+    uint32_t lum = tsl.getFullLuminosity();
+    full = lum >> 16;
+    t = millis();
+
+    if (t - lastAdjustMs >= adjustCooldownMs)
+    {
+      if (full > fullHigh)
+      {
+        if (gainIndex > gainMin)
         {
           gainIndex--;
-          setGain(gainIndex);
-          lastGainChangeMs = t;
+          setGainAndInt(gainIndex, intIndex);
+          lastAdjustMs = t;
         }
-        else if (als < alsLow && gainIndex < gainMax)
+        else if (intIndex > intMin)
         {
-          gainIndex++;
-          setGain(gainIndex);
-          lastGainChangeMs = t;
+          intIndex--;
+          setGainAndInt(gainIndex, intIndex);
+          lastAdjustMs = t;
         }
       }
-
-      Serial.print(t);
-      Serial.print(", ");
-      Serial.print(ltr.getGain());
-      Serial.print(", ");
-      Serial.print(ltr.getResolution()),
-          Serial.print(", ");
-      Serial.print(als);
-      Serial.println(); // debug
-
-      // printCSV(t, als, gainIndex, "MEASURE");
+      else if (full < fullLow)
+      {
+        if (intIndex < intMax)
+        {
+          intIndex++;
+          setGainAndInt(gainIndex, intIndex);
+          lastAdjustMs = t;
+        }
+        else if (gainIndex < gainMax)
+        {
+          gainIndex++;
+          setGainAndInt(gainIndex, intIndex);
+          lastAdjustMs = t;
+        }
+      }
     }
+
+    // Check if measurement time is up
+    if (millis() - measureStart >= measureTime)
+    {
+      state = 3;
+      break;
+    }
+
+    // Debug removed to clean serial output
+
+    printCSV(t, measureStart, full, gainIndex, intIndex, "MEASURE");
     break;
+  }
 
   case 3: // DONE
-    printCSV(t, 0, 0, "DONE");
-    // wait for RESET or START
+    t = millis();
+    printCSV(t, 0, 0, 0, 0, "DONE");
+    state = 0; // Back to IDLE
     break;
   }
 }
@@ -166,13 +247,13 @@ void setup()
     delay(10);
 
   pinMode(LED_BUILTIN, OUTPUT);
-  initLTR390();
+  initTSL2591();
   initAW9523();
 }
 
 void loop()
 {
-  if (aw_ok && ltr_ok)
+  if (aw_ok && tsl_ok)
   {
     runStateMachine();
   }
@@ -180,8 +261,8 @@ void loop()
   {
     Serial.println("AW9523 connection lost!");
   }
-  else if (!ltr_ok)
+  else if (!tsl_ok)
   {
-    Serial.println("LTR390 connection lost!");
+    Serial.println("TSL2591 connection lost!");
   }
 }
