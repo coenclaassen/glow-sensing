@@ -80,7 +80,7 @@ void initTSL2591()
   }
   else
   {
-    Serial.println("TSL2591 found");
+    Serial.println("TSL2591 found,0,0,0,0,SETUP");
     tsl.setGain(gainTable[gainIndex]);
     tsl.setTiming(intTable[intIndex]);
     tsl.enable();
@@ -97,7 +97,7 @@ void initAW9523()
   }
   else
   {
-    Serial.println("AW9523 found");
+    Serial.println("AW9523 found,0,0,0,0,SETUP");
     aw.pinMode(uvLedPin, AW9523_LED_MODE);
     aw.analogWrite(uvLedPin, 0);
   }
@@ -167,69 +167,69 @@ void runStateMachine()
     break;
 
   case 2: // MEASURE
+{
+  uint32_t lum = tsl.getFullLuminosity();
+
+  // TSL2591 packing:
+  // lower 16 bits = CH0 (full spectrum)
+  // upper 16 bits = CH1 (IR)
+  uint16_t ch0 = lum & 0xFFFF;   // FULL spectrum channel (CH0)
+  uint16_t ch1 = lum >> 16;      // IR channel (CH1)
+
+  // Estimate visible by subtracting IR (recommended for glow measurements)
+  int32_t vis = (int32_t)ch0 - (int32_t)ch1;
+  if (vis < 0) vis = 0;
+
+  // Store as your "full" output (keep your existing variable name)
+  full = (uint16_t)vis;
+
+  t = millis();
+
+  // --- Auto-adjust gain/integration based on VISIBLE signal (not IR) ---
+  if (t - lastAdjustMs >= adjustCooldownMs)
   {
-    // Check for STOP command
-    if (Serial.available())
+    if (full > fullHigh)
     {
-      String cmd = Serial.readStringUntil('\n');
-      cmd.trim();
-      if (cmd == "stop")
+      if (gainIndex > gainMin)
       {
-        state = 3;
-        break;
+        gainIndex--;
+        setGainAndInt(gainIndex, intIndex);
+        lastAdjustMs = t;
+      }
+      else if (intIndex > intMin)
+      {
+        intIndex--;
+        setGainAndInt(gainIndex, intIndex);
+        lastAdjustMs = t;
       }
     }
-
-    uint32_t lum = tsl.getFullLuminosity();
-    full = lum >> 16;
-    t = millis();
-
-    if (t - lastAdjustMs >= adjustCooldownMs)
+    else if (full < fullLow)
     {
-      if (full > fullHigh)
+      if (intIndex < intMax)
       {
-        if (gainIndex > gainMin)
-        {
-          gainIndex--;
-          setGainAndInt(gainIndex, intIndex);
-          lastAdjustMs = t;
-        }
-        else if (intIndex > intMin)
-        {
-          intIndex--;
-          setGainAndInt(gainIndex, intIndex);
-          lastAdjustMs = t;
-        }
+        intIndex++;
+        setGainAndInt(gainIndex, intIndex);
+        lastAdjustMs = t;
       }
-      else if (full < fullLow)
+      else if (gainIndex < gainMax)
       {
-        if (intIndex < intMax)
-        {
-          intIndex++;
-          setGainAndInt(gainIndex, intIndex);
-          lastAdjustMs = t;
-        }
-        else if (gainIndex < gainMax)
-        {
-          gainIndex++;
-          setGainAndInt(gainIndex, intIndex);
-          lastAdjustMs = t;
-        }
+        gainIndex++;
+        setGainAndInt(gainIndex, intIndex);
+        lastAdjustMs = t;
       }
     }
+  }
 
-    // Check if measurement time is up
-    if (millis() - measureStart >= measureTime)
-    {
-      state = 3;
-      break;
-    }
-
-    // Debug removed to clean serial output
-
-    printCSV(t, measureStart, full, gainIndex, intIndex, "MEASURE");
+  // Check if measurement time is up
+  if (millis() - measureStart >= measureTime)
+  {
+    state = 3;
     break;
   }
+
+  printCSV(t, measureStart, full, gainIndex, intIndex, "MEASURE");
+  break;
+}
 
   case 3: // DONE
     t = millis();
@@ -249,10 +249,15 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   initTSL2591();
   initAW9523();
+  aw.analogWrite(uvLedPin, 0);
 }
 
 void loop()
 {
+  
+
+
+  
   if (aw_ok && tsl_ok)
   {
     runStateMachine();
@@ -265,4 +270,5 @@ void loop()
   {
     Serial.println("TSL2591 connection lost!");
   }
+  
 }

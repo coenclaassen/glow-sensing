@@ -1,6 +1,6 @@
 t,measureStartTime,full,gain,int_idx,state
-TSL2591 found
-AW9523 found
+TSL2591 found,0,0,0,0,SETUP
+AW9523 found,0,0,0,0,SETUP
 13026,0,0,0,0,IDLE
 13027,0,0,0,0,IDLE
 13028,0,0,0,0,IDLE
